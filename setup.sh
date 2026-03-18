@@ -1,6 +1,6 @@
 #!/bin/bash
 # ── One-time setup — run INSIDE interactive GPU node ──
-# Creates venv, installs remaining deps, logs into wandb, downloads models
+# Creates venv, installs all deps, logs into wandb, downloads models
 #
 # Usage (after getting interactive node):
 #   bash setup.sh              # Full setup
@@ -22,31 +22,35 @@ echo "================================================"
 echo ""
 
 # ── Load modules (Case Western HPC) ──
+# Only load CUDA toolkit + Python, NOT the PyTorch module
+# (cluster PyTorch is built for sm_75, L40S needs sm_89)
 echo "[1/6] Loading modules..."
-module load GCC/11.2.0
+module purge
+module load GCC/12.3.0
 module load CUDA/12.1
 module load cuDNN/8.9.2.26-CUDA-12.1.1
-module load Python/3.11.3
-module load PyTorch/2.1.2-foss-2023a-CUDA-12.1.1
+module load Python/3.11.3-GCCcore-12.3.0
 echo "  CUDA: $(nvcc --version 2>/dev/null | grep release | awk '{print $6}' || echo 'loaded')"
 echo "  Python: $(python3 --version)"
-echo "  PyTorch: loaded from module (2.1.2 + CUDA 12.1.1)"
 echo ""
 
-# ── Create venv (inherit system site-packages for PyTorch) ──
+# ── Create venv (fresh, no system-site-packages) ──
 echo "[2/6] Creating virtual environment at $VENV_DIR ..."
 if [ -d "$VENV_DIR" ]; then
     echo "  Existing venv found. Removing and recreating..."
     rm -rf "$VENV_DIR"
 fi
-python3 -m venv --system-site-packages "$VENV_DIR"
+python3 -m venv "$VENV_DIR"
 source "$VENV_DIR/bin/activate"
 echo "  venv activated: $(which python)"
 echo ""
 
-# ── Install remaining dependencies (PyTorch comes from module) ──
+# ── Install dependencies ──
 echo "[3/6] Installing dependencies..."
 pip install --upgrade pip setuptools wheel -q
+
+echo "  Installing PyTorch (CUDA 12.1, supports L40S sm_89)..."
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 -q
 
 echo "  Installing HuggingFace + embeddings..."
 pip install transformers accelerate sentence-transformers -q
@@ -66,7 +70,7 @@ print(f'  PyTorch {torch.__version__}')
 print(f'  CUDA available: {torch.cuda.is_available()}')
 if torch.cuda.is_available():
     print(f'  GPU: {torch.cuda.get_device_name(0)}')
-    print(f'  VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB')
+    print(f'  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
 
 import transformers
 print(f'  Transformers {transformers.__version__}')
@@ -133,8 +137,12 @@ echo "================================================"
 echo ""
 echo "  Venv:     $VENV_DIR"
 echo ""
-echo "  Quick test:"
+echo "  Before running, always load modules first:"
+echo "    module purge"
+echo "    module load GCC/12.3.0 CUDA/12.1 cuDNN/8.9.2.26-CUDA-12.1.1 Python/3.11.3-GCCcore-12.3.0"
 echo "    source venv/bin/activate"
+echo ""
+echo "  Quick test:"
 echo "    python main.py --quick --device cuda --wandb --project evo-inject"
 echo ""
 echo "  Full run:"

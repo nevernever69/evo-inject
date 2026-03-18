@@ -33,11 +33,13 @@ echo "  Time:    $(date)"
 echo "================================================"
 
 # ── Load modules (Case Western HPC) ──
-module load GCC/11.2.0
+# No PyTorch module — cluster build is sm_75, L40S needs sm_89
+# PyTorch is pip-installed in venv with proper CUDA support
+module purge
+module load GCC/12.3.0
 module load CUDA/12.1
 module load cuDNN/8.9.2.26-CUDA-12.1.1
-module load Python/3.11.3
-module load PyTorch/2.1.2-foss-2023a-CUDA-12.1.1
+module load Python/3.11.3-GCCcore-12.3.0
 
 # ── Activate venv ──
 if [ ! -d "$VENV_DIR" ]; then
@@ -57,7 +59,7 @@ python -c "
 import torch
 assert torch.cuda.is_available(), 'CUDA not available!'
 print(f'CUDA device: {torch.cuda.get_device_name(0)}')
-print(f'VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB')
+print(f'VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
 "
 echo ""
 

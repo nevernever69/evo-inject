@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 *.pyo
+venv/
 logs/
 wandb/
 *.egg-info/

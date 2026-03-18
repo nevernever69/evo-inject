@@ -129,7 +129,8 @@ class Logger:
         self.log_file = os.path.join(log_dir, f'run_{int(time.time())}.jsonl')
 
     def log_generation(self, gen, metrics, population, gen_best=None, pre_evolve_avg=None):
-        if gen % LOG_EVERY_N_GENERATIONS != 0:
+        # Always log gen 1 and every N generations
+        if gen != 1 and gen % LOG_EVERY_N_GENERATIONS != 0:
             return
 
         best = gen_best or population.best()
@@ -205,7 +206,8 @@ class Logger:
             f.write(json.dumps(entry) + '\n')
 
     def save_best(self, gen, organism, metrics):
-        if gen % SAVE_BEST_EVERY != 0:
+        # Always save gen 1 and every N generations
+        if gen != 1 and gen % SAVE_BEST_EVERY != 0:
             return
 
         save_path = os.path.join(self.log_dir, f'best_gen_{gen}.json')

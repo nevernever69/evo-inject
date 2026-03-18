@@ -507,7 +507,55 @@ def main():
             def organisms(self): return [best_ever]
         print_gp_analysis(_BestWrapper())
 
-    print(f"\n  Logs saved to:    {logger.log_file}")
+    # Save final report to logs/
+    import json as _json
+    final_report = {
+        'generations': metrics.total_generations,
+        'total_requests': metrics.total_requests,
+        'total_successes': metrics.total_successes,
+        'success_rate': metrics.total_successes / max(1, metrics.total_requests),
+        'runtime_seconds': time.time() - metrics.start_time,
+        'unique_findings': reward_system.total_unique_findings(),
+        'best_fitness': best_ever_fitness,
+        'best_organism': best_ever.summary() if best_ever else None,
+        'findings': [],
+        'per_app': {},
+    }
+    for f in target.all_findings():
+        final_report['findings'].append({
+            'type': f.get('type', 'unknown'),
+            'severity': f.get('severity', '?'),
+            'detail': f.get('detail', ''),
+            'payload': f.get('payload', '')[:200],
+            'app_name': f.get('app_name', 'unknown'),
+            'strategies': f.get('strategies', []),
+        })
+    for app_cfg in TARGET_APPS:
+        name = app_cfg['name']
+        count = metrics.endpoint_counts.get(name, 0)
+        succ = metrics.endpoint_successes.get(name, 0)
+        final_report['per_app'][name] = {
+            'requests': count,
+            'successes': succ,
+            'rate': succ / count if count > 0 else 0,
+        }
+    if mutator:
+        final_report['mutator'] = mutator.stats()
+    if best_ever:
+        best_prog = best_ever.library.best_program() or best_ever.library.programs[0]
+        final_report['best_program'] = str(best_prog)
+        final_report['sample_payloads'] = [
+            best_prog.execute(clean_input=inp)[:200]
+            for inp in CLEAN_INPUTS[:5]
+        ]
+        final_report['fragments'] = best_ever.fragment_library.stats()
+
+    report_path = os.path.join(logger.log_dir, f'final_report_{int(time.time())}.json')
+    with open(report_path, 'w') as f:
+        _json.dump(final_report, f, indent=2, default=str)
+    print(f"\n  Final report:     {report_path}")
+
+    print(f"  Logs saved to:    {logger.log_file}")
     if wb.enabled:
         print(f"  wandb run:        {wb.run.url}")
     print("=" * 60)

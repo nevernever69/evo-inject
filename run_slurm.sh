@@ -37,6 +37,7 @@ module load GCC/11.2.0
 module load CUDA/12.1
 module load cuDNN/8.9.2.26-CUDA-12.1.1
 module load Python/3.11.3
+module load PyTorch/2.1.2-foss-2023a-CUDA-12.1.1
 
 # ── Activate venv ──
 if [ ! -d "$VENV_DIR" ]; then

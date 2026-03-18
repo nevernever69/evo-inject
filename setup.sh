@@ -1,6 +1,6 @@
 #!/bin/bash
 # ── One-time setup — run INSIDE interactive GPU node ──
-# Creates venv, installs all deps, logs into wandb, downloads models
+# Creates venv, installs remaining deps, logs into wandb, downloads models
 #
 # Usage (after getting interactive node):
 #   bash setup.sh              # Full setup
@@ -27,33 +27,29 @@ module load GCC/11.2.0
 module load CUDA/12.1
 module load cuDNN/8.9.2.26-CUDA-12.1.1
 module load Python/3.11.3
+module load PyTorch/2.1.2-foss-2023a-CUDA-12.1.1
 echo "  CUDA: $(nvcc --version 2>/dev/null | grep release | awk '{print $6}' || echo 'loaded')"
 echo "  Python: $(python3 --version)"
+echo "  PyTorch: loaded from module (2.1.2 + CUDA 12.1.1)"
 echo ""
 
-# ── Create venv ──
+# ── Create venv (inherit system site-packages for PyTorch) ──
 echo "[2/6] Creating virtual environment at $VENV_DIR ..."
 if [ -d "$VENV_DIR" ]; then
     echo "  Existing venv found. Removing and recreating..."
     rm -rf "$VENV_DIR"
 fi
-python3 -m venv venv
+python3 -m venv --system-site-packages "$VENV_DIR"
 source "$VENV_DIR/bin/activate"
 echo "  venv activated: $(which python)"
 echo ""
 
-# ── Install dependencies ──
+# ── Install remaining dependencies (PyTorch comes from module) ──
 echo "[3/6] Installing dependencies..."
 pip install --upgrade pip setuptools wheel -q
 
-echo "  Installing PyTorch (CUDA 12.1)..."
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 -q
-
 echo "  Installing HuggingFace + embeddings..."
 pip install transformers accelerate sentence-transformers -q
-
-echo "  Installing numpy..."
-pip install numpy -q
 
 echo "  Installing wandb..."
 pip install wandb -q
@@ -136,7 +132,6 @@ echo "  SETUP COMPLETE"
 echo "================================================"
 echo ""
 echo "  Venv:     $VENV_DIR"
-echo "  Activate: source $VENV_DIR/bin/activate"
 echo ""
 echo "  Quick test:"
 echo "    source venv/bin/activate"

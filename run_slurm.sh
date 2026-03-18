@@ -1,29 +1,28 @@
 #!/bin/bash
 #SBATCH --job-name=evo-inject
-#SBATCH --output=logs/slurm_%j.out
-#SBATCH --error=logs/slurm_%j.err
-#SBATCH --time=04:00:00
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:1
 #SBATCH --partition=gpu
 #SBATCH --constraint=gpul40s
-#SBATCH --gres=gpu:1
+#SBATCH --time=04:00:00
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
-#SBATCH --ntasks=1
+#SBATCH --output=/scratch/pioneer/users/axb2032/DeepQn/evo-inject/logs/%j.out
+#SBATCH --error=/scratch/pioneer/users/axb2032/DeepQn/evo-inject/logs/%j.err
+#SBATCH --mail-user=axb2032@case.edu
 #SBATCH --mail-type=ALL
 
 # ── GP-Evolving Prompt Injection Fuzzer ──
-# Runs on HPC with L40S GPU (48GB VRAM)
-# Llama 3 8B (~16GB in fp16) + sentence-transformers (~80MB)
-#
 # Prerequisites: run setup.sh first (creates venv, installs deps, wandb login)
 #
 # Usage:
-#   sbatch run_slurm.sh                       # Default (200 gens, 30 pop)
-#   sbatch run_slurm.sh --export=QUICK=1      # Quick test (3 gens, 5 pop)
-#   sbatch run_slurm.sh --export=NO_MUTATOR=1 # Raw GP only, no LLM mutator
+#   sbatch run_slurm.sh                  # Full run (200 gens, 30 pop)
+#   QUICK=1 sbatch run_slurm.sh          # Quick test (3 gens, 5 pop)
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VENV_DIR="$SCRIPT_DIR/venv"
+# ── Project directory ──
+PROJECT_DIR="/scratch/pioneer/users/axb2032/DeepQn/evo-inject"
+cd "$PROJECT_DIR"
+mkdir -p logs
 
 echo "================================================"
 echo "  EVO-INJECT - GP Prompt Injection Fuzzer"
@@ -33,24 +32,17 @@ echo "  Time:    $(date)"
 echo "================================================"
 
 # ── Load modules (Case Western HPC) ──
-# No PyTorch module — cluster build is sm_75, L40S needs sm_89
-# PyTorch is pip-installed in venv with proper CUDA support
 module purge
 module load GCC/12.3.0
 module load CUDA/12.1
 module load cuDNN/8.9.2.26-CUDA-12.1.1
 module load Python/3.11.3-GCCcore-12.3.0
 
-# Ignore ~/.local user-site packages (stale torch/transformers cause conflicts)
+# Ignore ~/.local user-site packages
 export PYTHONNOUSERSITE=1
 
 # ── Activate venv ──
-if [ ! -d "$VENV_DIR" ]; then
-    echo "ERROR: venv not found at $VENV_DIR"
-    echo "Run setup.sh first: bash setup.sh"
-    exit 1
-fi
-source "$VENV_DIR/bin/activate"
+source "$PROJECT_DIR/venv/bin/activate"
 
 echo "  Python:  $(python --version)"
 echo "  Torch:   $(python -c 'import torch; print(torch.__version__)' 2>/dev/null)"
@@ -66,14 +58,7 @@ print(f'VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
 "
 echo ""
 
-# ── Create logs dir ──
-mkdir -p "$SCRIPT_DIR/logs"
-cd "$SCRIPT_DIR"
-
 # ── Wandb ──
-# wandb credentials persist from setup.sh login
-# Set offline mode if no internet on compute nodes:
-# export WANDB_MODE=offline
 echo "  wandb: $(python -c 'import wandb; print(wandb.__version__)' 2>/dev/null || echo 'not installed')"
 echo ""
 
@@ -109,11 +94,5 @@ echo "================================================"
 echo "  Job finished at $(date)"
 echo "  Exit code: $EXIT_CODE"
 echo "================================================"
-
-# ── Sync wandb if offline ──
-if [ "${WANDB_MODE}" = "offline" ]; then
-    echo "Syncing wandb offline runs..."
-    wandb sync logs/wandb/
-fi
 
 exit $EXIT_CODE

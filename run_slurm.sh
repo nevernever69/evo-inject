@@ -4,10 +4,12 @@
 #SBATCH --error=logs/slurm_%j.err
 #SBATCH --time=04:00:00
 #SBATCH --partition=gpu
+#SBATCH --constraint=gpul40s
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
 #SBATCH --ntasks=1
+#SBATCH --mail-type=ALL
 
 # ── GP-Evolving Prompt Injection Fuzzer ──
 # Runs on HPC with L40S GPU (48GB VRAM)

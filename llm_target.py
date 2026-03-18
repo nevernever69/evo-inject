@@ -9,9 +9,13 @@ Replaces target.py (DVWA) for prompt injection experiments.
 """
 
 import time
+import logging
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# Suppress repetitive generation warnings
+logging.getLogger("transformers.generation.utils").setLevel(logging.ERROR)
 from config import (
     MODEL_NAME, MODEL_DTYPE, MODEL_MAX_NEW_TOKENS,
     MODEL_TEMPERATURE, MODEL_DEVICE,

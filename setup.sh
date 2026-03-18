@@ -34,6 +34,10 @@ echo "  CUDA: $(nvcc --version 2>/dev/null | grep release | awk '{print $6}' || 
 echo "  Python: $(python3 --version)"
 echo ""
 
+# ── Ignore ~/.local/lib user-site packages ──
+# Prevents stale user-installed torch/transformers from shadowing venv versions
+export PYTHONNOUSERSITE=1
+
 # ── Create venv (fresh, no system-site-packages) ──
 echo "[2/6] Creating virtual environment at $VENV_DIR ..."
 if [ -d "$VENV_DIR" ]; then

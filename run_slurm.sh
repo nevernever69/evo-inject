@@ -41,6 +41,9 @@ module load CUDA/12.1
 module load cuDNN/8.9.2.26-CUDA-12.1.1
 module load Python/3.11.3-GCCcore-12.3.0
 
+# Ignore ~/.local user-site packages (stale torch/transformers cause conflicts)
+export PYTHONNOUSERSITE=1
+
 # ── Activate venv ──
 if [ ! -d "$VENV_DIR" ]; then
     echo "ERROR: venv not found at $VENV_DIR"

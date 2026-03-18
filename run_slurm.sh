@@ -32,10 +32,11 @@ echo "  Node:    $SLURM_NODELIST"
 echo "  Time:    $(date)"
 echo "================================================"
 
-# ── Load modules ──
-module purge
-module load cuda/12.1
-module load python/3.11
+# ── Load modules (Case Western HPC) ──
+module load GCC/11.2.0
+module load CUDA/12.1
+module load cuDNN/8.9.2.26-CUDA-12.1.1
+module load Python/3.11.3
 
 # ── Activate venv ──
 if [ ! -d "$VENV_DIR" ]; then

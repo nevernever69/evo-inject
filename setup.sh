@@ -1,12 +1,10 @@
 #!/bin/bash
-# ── One-time setup — run BEFORE first SLURM job ──
+# ── One-time setup — run INSIDE interactive GPU node ──
 # Creates venv, installs all deps, logs into wandb, downloads models
 #
-# Usage:
+# Usage (after getting interactive node):
 #   bash setup.sh              # Full setup
 #   bash setup.sh --no-model   # Skip model download (if already cached)
-#
-# Run this on a login node or interactive session with GPU access
 
 set -e
 
@@ -23,12 +21,13 @@ echo "  EVO-INJECT SETUP"
 echo "================================================"
 echo ""
 
-# ── Load modules ──
+# ── Load modules (Case Western HPC) ──
 echo "[1/6] Loading modules..."
-module purge
-module load cuda/12.1
-module load python/3.11  # Adjust to your cluster's available version
-echo "  CUDA: $(nvcc --version 2>/dev/null | grep release | awk '{print $6}' || echo 'module loaded')"
+module load GCC/11.2.0
+module load CUDA/12.1
+module load cuDNN/8.9.2.26-CUDA-12.1.1
+module load Python/3.11.3
+echo "  CUDA: $(nvcc --version 2>/dev/null | grep release | awk '{print $6}' || echo 'loaded')"
 echo "  Python: $(python3 --version)"
 echo ""
 
@@ -38,7 +37,7 @@ if [ -d "$VENV_DIR" ]; then
     echo "  Existing venv found. Removing and recreating..."
     rm -rf "$VENV_DIR"
 fi
-python3 -m venv "$VENV_DIR"
+python3 -m venv venv
 source "$VENV_DIR/bin/activate"
 echo "  venv activated: $(which python)"
 echo ""
@@ -99,7 +98,7 @@ echo ""
 
 # ── Download models ──
 if [ "$SKIP_MODEL" = false ]; then
-    echo "[6/6] Pre-downloading models (saves GPU job time)..."
+    echo "[6/6] Pre-downloading models (saves time on runs)..."
     echo "  This downloads ~16GB for Llama 3 8B + ~80MB for embeddings."
     echo "  Make sure you have accepted the Llama 3 license on HuggingFace:"
     echo "  https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct"
@@ -139,11 +138,10 @@ echo ""
 echo "  Venv:     $VENV_DIR"
 echo "  Activate: source $VENV_DIR/bin/activate"
 echo ""
-echo "  To run:"
-echo "    sbatch run_slurm.sh                    # Default (200 gens, 30 pop)"
-echo "    sbatch run_slurm.sh --export=QUICK=1   # Quick test (3 gens, 5 pop)"
+echo "  Quick test:"
+echo "    source venv/bin/activate"
+echo "    python main.py --quick --device cuda --wandb --project evo-inject"
 echo ""
-echo "  To monitor:"
-echo "    tail -f logs/slurm_<jobid>.out"
-echo "    wandb dashboard: https://wandb.ai"
+echo "  Full run:"
+echo "    python main.py --gens 200 --pop 30 --steps 30 --device cuda --wandb"
 echo ""

@@ -219,7 +219,7 @@ class DetailedLogger:
                 'avg_loss': best.memory.avg_loss(),
                 'avg_refine': best.memory.avg_refinement_improvement(),
                 'findings_count': len(best.memory.findings),
-                'apps_targeted': len(best.memory.app_history),
+                'apps_targeted': len(best.memory.apps_tried),
             },
             'archive': {
                 'coverage': archive_stats['coverage'],

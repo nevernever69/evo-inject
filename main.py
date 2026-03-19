@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-main.py - GP-Evolving Prompt Injection Fuzzer
+main.py - Compositional Evolutionary Attack Search
 
-Organisms evolve GP programs that construct prompt injections from raw ASCII.
-No hardcoded attack strategies. Evolution discovers injection patterns.
+Two-level architecture:
+  Level 1: GP programs evolve attack STRUCTURE (phrases + token blocks)
+  Level 2: Loss-guided hill climbing refines raw token blocks
 
-Target: Local Llama 3 8B running 5 different LLM applications, each with
-system prompts and restrictions the fuzzer tries to violate.
-
-The research question: Can evolution, starting from single characters
-and basic string operations, independently discover prompt injection
-patterns — without being told what prompt injection is?
+Key components:
+  - Phrase library: shared coherent building blocks (seeded + evolved)
+  - Token blocks: small raw token regions for sub-semantic exploration
+  - Loss-guided refinement: hill climbing on CE loss without gradients
+  - MAP-Elites archive: quality-diversity across attack types/apps/sizes
 
 Usage:
     python main.py                    # Run with defaults
     python main.py --quick            # Quick test (3 gens, 5 pop)
     python main.py --wandb            # Log to wandb
     python main.py --gens 50 --pop 20 # Custom params
-    python main.py --no-mutator       # Disable LLM-as-mutator (raw GP only)
+    python main.py --no-loss          # Disable loss computation
+    python main.py --no-refine        # Disable token block refinement
     python main.py --device cpu       # Run on CPU (slow, for testing)
 """
 
@@ -26,6 +27,7 @@ import os
 import time
 import argparse
 import random
+import json
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -33,75 +35,133 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 from config import (
     POPULATION_SIZE, GENERATIONS, STEPS_PER_LIFETIME,
-    LOG_EVERY_N_GENERATIONS, SAVE_BEST_EVERY,
-    TARGET_APPS, CLEAN_INPUTS,
+    LOG_EVERY_N_GENERATIONS, SAVE_BEST_EVERY, CHECKPOINT_EVERY,
+    TARGET_APPS, CLEAN_INPUTS, ARCHIVE_ATTACK_TYPES,
 )
 from organism import Organism
 from reward import InjectionReward
 from llm_target import LLMTarget
-from mutator import Mutator
 from evolution import Population
 from measurement import Metrics, Logger, WandbLogger
-from gp import extract_vocabulary, program_complexity, extract_strategies
+from gp import program_complexity, extract_token_ids
+from phrases import PhraseLibrary
+from archive import MAPElitesArchive
+from refinement import refine_token_blocks
 
 
-def run_lifetime(organism, target, mutator, reward_system, metrics):
+def flatten_components(components):
+    """Flatten component list into a single token ID list."""
+    tokens = []
+    for ctype, metadata, toks in components:
+        tokens.extend(toks)
+    return tokens
+
+
+def run_lifetime(organism, target, reward_system, metrics, phrase_library,
+                 archive, compute_loss=True, do_refine=True):
     """
-    One organism's lifetime: probe LLM applications for injection vulnerabilities.
+    One organism's lifetime.
 
     Each step:
-      1. Brain picks which app to target (RL)
-      2. Library selects a GP program, generates payload + strategies
-      3. Optional: mutator LLM refines raw GP output into coherent text
-      4. Send to target LLM application
-      5. Reward system analyzes response (embedding distance, leak detection, etc.)
-      6. Library adapts: clone successful programs, replace failures
+      1. Brain picks which app to target
+      2. Library selects GP program → composes structure (phrases + token blocks)
+      3. If do_refine: loss-guided hill climbing refines token blocks
+      4. Assembled payload injected into model
+      5. Reward computed (with coherence gate)
+      6. Results fed to library (clonal selection) + archive (MAP-Elites)
       7. Brain learns from experience
     """
     apps = target.apps
     last_result = None
     last_app_idx = 0
 
+    # Get separator tokens for the target model
+    separator_tokens = target.get_separator_tokens()
+
     for step in range(STEPS_PER_LIFETIME):
-        # Brain observes state and picks target app
+        # Brain picks target app
         state = organism.observe_state(apps, last_app_idx, last_result)
         app_idx = organism.choose_endpoint(state)
         app_idx = app_idx % len(apps)
         last_app_idx = app_idx
-
         app = apps[app_idx]
 
-        # Library selects program, generates raw payload + strategies
-        clean_input = random.choice(CLEAN_INPUTS)
-        raw_payload, program_idx, strategies = organism.generate_payload(
-            clean_input=clean_input,
-            app_name=app.name,
+        # Get target instruction tokens
+        target_inst_tokens = target.tokenize(app.test_instruction)
+
+        # Library selects program, produces structure
+        components, program_idx = organism.generate_payload(
+            phrase_library=phrase_library,
+            target_instruction_tokens=target_inst_tokens,
+            separator_tokens=separator_tokens,
         )
 
-        # Optional: mutator refines into coherent text
-        if mutator and strategies:
-            payload = mutator.mutate(raw_payload, strategies, app.name)
-        else:
-            payload = raw_payload
+        if not components:
+            organism.memory.record(app.name, app_idx, -10, False)
+            organism.library.record_result(program_idx, -10, False)
+            metrics.record_step(app.name, False)
+            continue
 
-        # Truncate to reasonable length
-        payload = payload[:2000]
+        # Track which phrases were used (for phrase library feedback)
+        used_phrase_indices = set()
+        for ctype, metadata, _ in components:
+            if ctype == 'phrase' and isinstance(metadata, int) and metadata >= 0:
+                phrase_library.record_use(metadata)
+                used_phrase_indices.add(metadata)
 
-        # Send to target LLM
-        response = target.generate(app, payload)
+        # Loss-guided refinement of token blocks
+        refine_stats = None
+        has_token_blocks = any(ct == 'token_block' for ct, _, _ in components)
+
+        if do_refine and has_token_blocks and compute_loss:
+            components, refine_stats = refine_token_blocks(
+                components, target, app, app.test_instruction,
+            )
+            if refine_stats:
+                organism.memory.record_refinement(refine_stats)
+
+        # Flatten to token list
+        flat_tokens = flatten_components(components)
+
+        if not flat_tokens:
+            organism.memory.record(app.name, app_idx, -10, False)
+            organism.library.record_result(program_idx, -10, False)
+            metrics.record_step(app.name, False)
+            continue
+
+        # Generate response from target LLM
+        response = target.generate_from_tokens(app, flat_tokens)
         if response is None or response.get('error'):
             organism.memory.record(app.name, app_idx, -10, False)
             organism.library.record_result(program_idx, -10, False)
             metrics.record_step(app.name, False)
             continue
 
-        # Compute reward
-        reward, findings = reward_system.analyze(response, app, payload)
+        # Compute loss
+        loss_info = None
+        if compute_loss:
+            loss = target.compute_loss(app, flat_tokens, app.test_instruction)
+            loss_info = {
+                'loss': loss,
+                'baseline_loss': app.baseline_loss,
+            }
+            organism.memory.record_loss(loss)
 
-        # Record
-        found_something = len(findings) > 0
+        # Check coherence (for the gate)
+        coherence_info = target.check_token_coherence(flat_tokens)
+
+        # Compute reward
+        reward, findings = reward_system.analyze(
+            response, app, flat_tokens,
+            loss_info=loss_info,
+            coherence_info=coherence_info,
+        )
+
+        # Record results
+        found_something = len(findings) > 0 and not any(
+            f.get('type') == 'coherence_gate' for f in findings
+        )
         response['had_findings'] = found_something
-        # Add embedding distance to response for brain state
         for f in findings:
             if f.get('type') == 'embedding_deviation':
                 response['embedding_distance'] = f.get('distance', 0.0)
@@ -110,25 +170,58 @@ def run_lifetime(organism, target, mutator, reward_system, metrics):
 
         organism.memory.record(app.name, app_idx, reward, found_something)
         organism.library.record_result(program_idx, reward, found_something)
-        organism.update_context(payload, response.get('text'), found_something)
         metrics.record_step(app.name, found_something)
 
         if found_something:
             active_program = organism.library.get_active_program()
+            payload_text = target.decode_tokens(flat_tokens)
+
             for f in findings:
-                f['payload'] = payload[:200]
+                f['payload'] = payload_text[:200]
+                f['payload_tokens'] = flat_tokens[:20]
                 f['app_name'] = app.name
                 f['program'] = str(active_program)[:100]
                 f['program_idx'] = program_idx
-                f['strategies'] = strategies[:5]
-                organism.memory.record_finding(f, payload, active_program)
+                if refine_stats:
+                    f['refinement'] = refine_stats
+                organism.memory.record_finding(
+                    f, flat_tokens, components=components,
+                    program=active_program,
+                )
                 target.record_finding(app.name, f)
 
-            # If system prompt was leaked, store hint for reactive use
-            for f in findings:
-                if f.get('type') == 'system_prompt_leak':
-                    organism.record_system_hint(response.get('text', '')[:200])
-                    break
+            # Update phrase success tracking
+            for pidx in used_phrase_indices:
+                phrase_library.record_success(pidx)
+
+            # Try to insert into MAP-Elites archive
+            attack_type = active_program.dominant_category(phrase_library)
+            structure_class = active_program.structure_class()
+
+            inserted, is_new, archive_bonus = archive.try_insert(
+                attack_type=attack_type,
+                app_name=app.name,
+                structure_class=structure_class,
+                fitness=reward,
+                components=components,
+                flat_tokens=flat_tokens,
+                program=active_program,
+                generation=organism.generation,
+                response_text=response.get('text', ''),
+                findings=findings,
+                refinement_stats=refine_stats,
+                phrase_indices=list(used_phrase_indices),
+            )
+
+            if archive_bonus > 0:
+                reward += archive_bonus
+                organism.memory.total_reward += archive_bonus
+
+            # Try to promote new phrases from successful payloads
+            if reward > 50:
+                _try_promote_phrases(
+                    components, flat_tokens, target, phrase_library, attack_type,
+                )
 
         # Brain learns
         next_state = organism.observe_state(apps, app_idx, response)
@@ -138,22 +231,42 @@ def run_lifetime(organism, target, mutator, reward_system, metrics):
     return organism
 
 
-def run_generation(population, target, mutator, reward_system, metrics, gen):
-    """Run one full generation — sequential organism evaluation."""
+def _try_promote_phrases(components, flat_tokens, target, phrase_library,
+                         attack_type):
+    """Try to promote successful component sequences as new phrases."""
+    for ctype, metadata, tokens in components:
+        if ctype == 'token_block' and len(tokens) >= 3:
+            # Decode and check if it's coherent enough to promote
+            text = target.decode_tokens(tokens)
+            if text and len(text.strip()) > 3:
+                # Only promote if it has recognizable words
+                words = text.strip().split()
+                if len(words) >= 2:
+                    phrase_library.try_promote(
+                        text.strip(), tokens, category=attack_type,
+                    )
+
+
+def run_generation(population, target, reward_system, metrics, gen,
+                   phrase_library, archive,
+                   compute_loss=True, do_refine=True):
+    """Run one full generation."""
     n_organisms = len(population.organisms)
 
     for i, organism in enumerate(population.organisms):
-        # Reset per-organism novelty tracking
         reward_system.reset_local()
 
-        run_lifetime(organism, target, mutator, reward_system, metrics)
+        run_lifetime(
+            organism, target, reward_system, metrics, phrase_library,
+            archive, compute_loss=compute_loss, do_refine=do_refine,
+        )
 
         if (i + 1) % 5 == 0 or (i + 1) == n_organisms:
             print(f"  Organism {i + 1}/{n_organisms} done", end='\r')
 
     print(f"  Organism {n_organisms}/{n_organisms} done")
 
-    # Evaluate and record metrics BEFORE evolve
+    # Evaluate fitness
     population.evaluate_all()
     metrics.record_generation(population)
 
@@ -161,14 +274,17 @@ def run_generation(population, target, mutator, reward_system, metrics, gen):
     pre_evolve_avg = population.avg_fitness()
 
     # Track discoveries
-    new_unique = reward_system.total_unique_findings() - getattr(metrics, '_last_unique_findings', 0)
+    new_unique = (
+        reward_system.total_unique_findings()
+        - getattr(metrics, '_last_unique_findings', 0)
+    )
     if new_unique > 0:
         for _ in range(new_unique):
             metrics.record_discovery(f"gen_{gen}")
     metrics._last_unique_findings = reward_system.total_unique_findings()
 
-    # Evolve
-    stats = population.evolve()
+    # Evolve (pass archive for diversity seeding)
+    stats = population.evolve(archive=archive)
     return stats, pre_evolve_best, pre_evolve_avg
 
 
@@ -200,36 +316,59 @@ def print_findings_report(target, reward_system):
                 severity = f.get('severity', '?')
                 detail = f.get('detail', '')
                 payload = f.get('payload', '')[:80]
-                strategies = f.get('strategies', [])
                 print(f"    [{severity:8s}] {ftype}: {detail}")
                 print(f"            payload: {payload}")
-                if strategies:
-                    print(f"            strategies: {strategies}")
+                tokens = f.get('payload_tokens', [])
+                if tokens:
+                    print(f"            tokens: {tokens[:10]}{'...' if len(tokens) > 10 else ''}")
+                if f.get('refinement'):
+                    rs = f['refinement']
+                    print(f"            refine: {rs.get('improvements', 0)} improvements, "
+                          f"loss {rs.get('loss_before', 0):.2f} → {rs.get('loss_after', 0):.2f}")
 
     print(f"\n  Unique finding signatures: {reward_system.total_unique_findings()}")
 
 
-def print_gp_analysis(population):
+def print_archive_report(archive, target):
+    """Print MAP-Elites archive status."""
+    stats = archive.stats()
+    print(f"\n  {'='*60}")
+    print(f"  MAP-ELITES ARCHIVE")
+    print(f"  {'='*60}")
+    print(f"  Coverage: {stats['occupied']}/{stats['total_cells']} "
+          f"({stats['coverage']:.1%})")
+    print(f"  Total updates: {stats['total_updates']}")
+    print(f"  New cells filled: {stats['total_fills']}")
+
+    if stats['fitness']['n'] > 0:
+        print(f"  Fitness: mean={stats['fitness']['mean']:.1f} "
+              f"max={stats['fitness']['max']:.1f}")
+
+    print(f"\n  By attack type:")
+    for at, cov in stats['by_attack_type'].items():
+        best = stats['best_per_attack_type'].get(at, 0)
+        bar = '#' * int(cov * 20)
+        print(f"    {at:25s} {cov:5.1%} best={best:.0f} {bar}")
+
+    print(f"\n  By app:")
+    for app, cov in stats['by_app'].items():
+        best = stats['best_per_app'].get(app, 0)
+        bar = '#' * int(cov * 20)
+        print(f"    {app:25s} {cov:5.1%} best={best:.0f} {bar}")
+
+
+def print_gp_analysis(population, target, phrase_library):
     """Analyze what GP programs have evolved."""
     best = population.best()
     print(f"\n  {'='*60}")
-    print(f"  GP PROGRAM ANALYSIS")
+    print(f"  GP PROGRAM ANALYSIS (COMPOSITIONAL)")
     print(f"  {'='*60}")
 
-    # Library overview
     lib_stats = best.library.stats()
-    frag_stats = best.fragment_library.stats()
     print(f"\n  Library: {lib_stats['library_size']} programs")
     print(f"  Clonal events: {lib_stats['clonal_events']}")
     print(f"  Replacements: {lib_stats['replacements']}")
     print(f"  Avg program length: {lib_stats['avg_program_length']:.1f}")
-    print(f"  Fragments discovered: {frag_stats['num_fragments']}")
-
-    # Fragment library contents
-    if best.fragment_library.fragments:
-        print(f"\n  Discovered fragments:")
-        for slot, text in list(best.fragment_library.fragments.items())[:10]:
-            print(f"    [{slot}] '{text[:60]}'")
 
     # Per-program breakdown
     print(f"\n  Per-program stats:")
@@ -238,45 +377,92 @@ def print_gp_analysis(population):
         reward = lib_stats['program_rewards'][i]
         successes = lib_stats['program_successes'][i]
         rate = reward / uses if uses > 0 else 0
-        strategies = extract_strategies(prog)
         marker = " *" if successes > 0 else ""
-        strat_str = f" strategies={strategies}" if strategies else ""
+        cat = prog.dominant_category(phrase_library)
         print(f"    [{i}] {prog.length():2d} insts | "
               f"uses={uses:3d} succ={successes:2d} "
-              f"rate={rate:.1f}{marker}{strat_str}")
+              f"rate={rate:.1f} cat={cat}{marker}")
 
     # Best program details
     best_prog = best.library.best_program() or best.library.programs[0]
     print(f"\n  Best program ({best_prog.length()} instructions):")
     print(f"    {best_prog}")
 
-    # Sample payloads
-    print(f"\n  Sample payloads from best program:")
-    for inp in CLEAN_INPUTS[:3]:
-        payload = best_prog.execute(clean_input=inp)
-        print(f"    input='{inp}' -> '{payload[:80]}'")
+    # Sample execution
+    print(f"\n  Sample payload from best program:")
+    target_inst_tokens = target.tokenize("Write a haiku about cats.")
+    components = best_prog.execute(
+        phrase_library=phrase_library,
+        target_instruction_tokens=target_inst_tokens,
+    )
+    flat = flatten_components(components)
+    decoded = target.decode_tokens(flat) if flat else "(empty)"
+    print(f"    Components: {len(components)}")
+    for ct, meta, toks in components[:8]:
+        tok_text = target.decode_tokens(toks)[:60] if toks else ""
+        print(f"      [{ct:12s}] {len(toks):3d} tokens → '{tok_text}'")
+    print(f"    Full payload: {len(flat)} tokens → '{decoded[:100]}'")
 
-    # Vocabulary analysis
-    chars, strings = extract_vocabulary(best_prog)
-    if chars:
-        print(f"\n  Characters evolved: {sorted(chars)[:30]}")
-    if strings:
-        print(f"  Strings evolved: {sorted(strings)[:10]}")
+    # Phrase library stats
+    phrase_stats = phrase_library.stats()
+    print(f"\n  Phrase library: {phrase_stats['total_phrases']} phrases "
+          f"({phrase_stats['seed_phrases']} seed, "
+          f"{phrase_stats['promoted_phrases']} promoted)")
+    print(f"  Total phrase uses: {phrase_stats['total_uses']}")
+    print(f"  Total phrase successes: {phrase_stats['total_successes']}")
 
-    # Strategies evolved
-    prog_strategies = extract_strategies(best_prog)
-    if prog_strategies:
-        print(f"  Strategies evolved: {prog_strategies}")
+    # Top phrases by success rate
+    phrases_by_rate = sorted(
+        enumerate(phrase_library.phrases),
+        key=lambda x: x[1]['successes'] / max(x[1]['uses'], 1),
+        reverse=True,
+    )
+    print(f"\n  Top phrases:")
+    for idx, p in phrases_by_rate[:5]:
+        rate = p['successes'] / max(p['uses'], 1)
+        print(f"    [{idx:2d}] uses={p['uses']:3d} succ={p['successes']:3d} "
+              f"rate={rate:.2f} [{p['category']}] '{p['text'][:50]}'")
 
+    # Complexity
     cx = program_complexity(best_prog)
-    print(f"  Unique ops: {cx['unique_ops']}, Pushes: {cx['pushes']}, "
-          f"Transforms: {cx['transforms']}, Strategies: {cx['strategies']}, "
-          f"Fragments: {cx['fragments']}")
+    print(f"\n  Program complexity:")
+    print(f"    Phrases: {cx['phrases']}, Token blocks: {cx['token_blocks']}, "
+          f"Separators: {cx['separators']}, Unique tokens: {cx['unique_tokens']}")
+    print(f"    Block/phrase ratio: {cx['ratio']:.2f}")
+
+    # Loss info
+    avg_loss = best.memory.avg_loss()
+    if avg_loss != float('inf'):
+        print(f"  Average loss: {avg_loss:.2f}")
+    avg_refine = best.memory.avg_refinement_improvement()
+    if avg_refine > 0:
+        print(f"  Avg refinement improvement: {avg_refine:.3f}")
+
+
+def save_checkpoint(population, archive, phrase_library, metrics, gen,
+                    log_dir='logs'):
+    """Save full checkpoint for resuming."""
+    ckpt = {
+        'generation': gen,
+        'archive': archive.to_dict(),
+        'phrase_library_stats': phrase_library.stats(),
+        'population_size': len(population.organisms),
+        'best_fitness': population.best().fitness,
+        'metrics_snapshot': {
+            'total_requests': metrics.total_requests,
+            'total_successes': metrics.total_successes,
+            'total_discoveries': metrics.total_discoveries,
+        },
+    }
+    path = os.path.join(log_dir, f'checkpoint_gen_{gen}.json')
+    with open(path, 'w') as f:
+        json.dump(ckpt, f, indent=2, default=str)
+    print(f"  Checkpoint saved: {path}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='GP-Evolving Prompt Injection Fuzzer'
+        description='Compositional Evolutionary Attack Search'
     )
     parser.add_argument('--gens', type=int, default=GENERATIONS)
     parser.add_argument('--pop', type=int, default=POPULATION_SIZE)
@@ -284,13 +470,13 @@ def main():
     parser.add_argument('--quick', action='store_true',
                         help='Quick test (3 gens, 5 pop, 10 steps)')
     parser.add_argument('--wandb', action='store_true')
-    parser.add_argument('--project', type=str, default='parasite-llm')
-    parser.add_argument('--no-mutator', action='store_true',
-                        help='Disable LLM-as-mutator (raw GP only)')
-    parser.add_argument('--device', type=str, default=None,
-                        help='Device: cuda, cpu, auto (default: from config)')
-    parser.add_argument('--model', type=str, default=None,
-                        help='Model name/path (default: from config)')
+    parser.add_argument('--project', type=str, default='evo-inject-compositional')
+    parser.add_argument('--no-loss', action='store_true',
+                        help='Disable loss computation')
+    parser.add_argument('--no-refine', action='store_true',
+                        help='Disable token block refinement')
+    parser.add_argument('--device', type=str, default=None)
+    parser.add_argument('--model', type=str, default=None)
     args = parser.parse_args()
 
     if args.quick:
@@ -303,16 +489,21 @@ def main():
     if args.device:
         config.MODEL_DEVICE = args.device
 
+    compute_loss = not args.no_loss
+    do_refine = not args.no_refine and compute_loss
+
     print("=" * 60)
-    print("  GP-EVOLVING PROMPT INJECTION FUZZER")
-    print("  Organisms evolve injections from raw ASCII")
-    print("  No hardcoded attack strategies")
+    print("  COMPOSITIONAL EVOLUTIONARY ATTACK SEARCH")
+    print("  GP evolves attack structure (phrases + token blocks)")
+    print("  Loss-guided hill climbing refines token blocks")
+    print("  MAP-Elites maintains diverse attack portfolio")
     print("=" * 60)
     print(f"\n  Population:   {args.pop}")
     print(f"  Generations:  {args.gens}")
     print(f"  Steps/life:   {args.steps}")
     print(f"  Target apps:  {len(TARGET_APPS)}")
-    print(f"  Mutator:      {'enabled' if not args.no_mutator else 'disabled (raw GP only)'}")
+    print(f"  Loss signal:  {'enabled' if compute_loss else 'disabled'}")
+    print(f"  Refinement:   {'enabled' if do_refine else 'disabled'}")
     print(f"  Device:       {config.MODEL_DEVICE}")
     print()
 
@@ -322,6 +513,11 @@ def main():
         device=config.MODEL_DEVICE,
     )
     target.load_model()
+
+    # Initialize phrase library with seed phrases
+    phrase_library = PhraseLibrary()
+    n_phrases = phrase_library.init_from_seeds(target.tokenizer)
+    print(f"  Phrase library: {n_phrases} seed phrases loaded")
 
     # Establish baselines
     target.establish_baselines()
@@ -334,17 +530,17 @@ def main():
         if app.baseline and app.baseline.get('texts'):
             reward_system.establish_baseline(app.name, app.baseline['texts'])
 
-    # Initialize mutator (shares model with target)
-    mutator = None
-    if not args.no_mutator:
-        mutator = Mutator(target)
-        print(f"  Mutator initialized (shares model)")
+    # Initialize MAP-Elites archive
+    archive = MAPElitesArchive()
+    print(f"  MAP-Elites archive: {archive.total_cells()} cells "
+          f"({len(ARCHIVE_ATTACK_TYPES)} types x {len(TARGET_APPS)} apps x 3 sizes)")
 
+    # Initialize population with phrase library
     metrics = Metrics()
     logger = Logger()
-    population = Population(size=args.pop)
+    population = Population(size=args.pop, phrase_library=phrase_library)
 
-    # wandb
+    # wandb config
     wandb_config = {
         'population_size': args.pop,
         'generations': args.gens,
@@ -354,10 +550,15 @@ def main():
         'gp_max_length': config.GP_MAX_PROGRAM_LENGTH,
         'gp_mutation_rate': config.GP_MUTATION_RATE,
         'gp_crossover_rate': config.GP_CROSSOVER_RATE,
-        'state_size': config.STATE_SIZE,
-        'action_size': config.ACTION_SIZE,
-        'mutator_enabled': not args.no_mutator,
+        'max_payload_tokens': config.MAX_PAYLOAD_TOKENS,
+        'token_block_size': config.TOKEN_BLOCK_SIZE,
+        'refine_steps': config.REFINE_STEPS,
+        'phrase_library_size': n_phrases,
+        'archive_cells': archive.total_cells(),
+        'compute_loss': compute_loss,
+        'do_refine': do_refine,
         'device': config.MODEL_DEVICE,
+        'version': 'v3-compositional',
     }
     wb = WandbLogger(
         config_dict=wandb_config,
@@ -367,19 +568,24 @@ def main():
 
     # Show initial info
     sample_org = population.organisms[0]
-    sample_payload, _, sample_strategies = sample_org.generate_payload('test')
+    sample_components, _ = sample_org.generate_payload(
+        phrase_library=phrase_library,
+        target_instruction_tokens=target.tokenize("Write a haiku."),
+    )
+    sample_flat = flatten_components(sample_components)
+    sample_decoded = target.decode_tokens(sample_flat) if sample_flat else "(empty)"
+
     print(f"\n  Brain params: {sample_org.brain.network.num_params()}")
     print(f"  Library size: {len(sample_org.library.programs)} programs/organism")
     print(f"  Target apps: {[a.name for a in target.apps]}")
-    print(f"  Sample GP program: {sample_org.library.programs[0]}")
-    print(f"  Sample payload: {sample_payload[:60]}")
-    if sample_strategies:
-        print(f"  Sample strategies: {sample_strategies}")
+    print(f"  Sample program: {sample_org.library.programs[0]}")
+    print(f"  Sample components: {len(sample_components)}")
+    print(f"  Sample payload: {len(sample_flat)} tokens → '{sample_decoded[:60]}'")
 
     if args.wandb and wb.enabled:
         print(f"  wandb:        {wb.run.url}")
     print()
-    print("Starting GP evolution...")
+    print("Starting compositional evolutionary attack search...")
     print("-" * 60)
 
     best_ever = None
@@ -390,7 +596,9 @@ def main():
             gen_start = time.time()
 
             stats, gen_best, pre_evolve_avg = run_generation(
-                population, target, mutator, reward_system, metrics, gen,
+                population, target, reward_system, metrics, gen,
+                phrase_library, archive,
+                compute_loss=compute_loss, do_refine=do_refine,
             )
 
             gen_time = time.time() - gen_start
@@ -404,12 +612,15 @@ def main():
                 gen, metrics, population,
                 gen_best=gen_best,
                 pre_evolve_avg=pre_evolve_avg,
+                archive=archive,
+                phrase_library=phrase_library,
             )
             logger.save_best(gen, gen_best, metrics)
 
             # wandb logging
             if wb.enabled:
                 genome_stats = population.genome_stats()
+                archive_stats = archive.stats()
 
                 wb_data = {
                     'fitness/best': gen_best.fitness,
@@ -421,9 +632,9 @@ def main():
                         if metrics.gen_success_rate else 0
                     ),
                     'gp/avg_program_length': genome_stats['program_length']['mean'],
-                    'gp/vocab_chars': genome_stats.get('_vocab_chars', 0),
-                    'gp/vocab_strings': genome_stats.get('_vocab_strings', 0),
-                    'gp/transform_ratio': genome_stats['transform_ratio']['mean'],
+                    'gp/unique_tokens': genome_stats.get('_vocab_tokens', 0),
+                    'gp/total_phrases': genome_stats.get('total_phrases', 0),
+                    'gp/total_blocks': genome_stats.get('total_token_blocks', 0),
                     'behavior/total_requests': metrics.total_requests,
                     'behavior/total_successes': metrics.total_successes,
                     'findings/unique_signatures': reward_system.total_unique_findings(),
@@ -433,51 +644,66 @@ def main():
                     'library/clonal_events': genome_stats.get('total_clonal_events', 0),
                     'library/replacements': genome_stats.get('total_replacements', 0),
                     'library/programs_successful': genome_stats.get('programs_with_success', 0),
-                    'library/total_fragments': genome_stats.get('total_fragments', 0),
+                    'archive/coverage': archive_stats['coverage'],
+                    'archive/occupied': archive_stats['occupied'],
+                    'archive/total_fills': archive_stats['total_fills'],
+                    'archive/total_updates': archive_stats['total_updates'],
+                    'phrases/total': phrase_library.size(),
+                    'phrases/promoted': phrase_library.stats()['promoted_phrases'],
                     'timing/gen_seconds': gen_time,
                 }
 
-                # Per-app distribution
+                # Per-app
                 for app_cfg in TARGET_APPS:
                     name = app_cfg['name']
                     count = metrics.endpoint_counts.get(name, 0)
                     succ = metrics.endpoint_successes.get(name, 0)
                     wb_data[f'apps/{name}_rate'] = succ / count if count > 0 else 0
-                    wb_data[f'apps/{name}_count'] = count
 
-                # Mutator stats
-                if mutator:
-                    mstats = mutator.stats()
-                    wb_data['mutator/mutations'] = mstats['total_mutations']
-                    wb_data['mutator/fallbacks'] = mstats['total_fallbacks']
-                    wb_data['mutator/rate'] = mstats['mutation_rate']
+                # Loss tracking
+                if compute_loss:
+                    avg_loss = gen_best.memory.avg_loss()
+                    if avg_loss != float('inf'):
+                        wb_data['loss/best_avg_loss'] = avg_loss
+
+                # Refinement tracking
+                if do_refine:
+                    avg_refine = gen_best.memory.avg_refinement_improvement()
+                    wb_data['refinement/avg_improvement'] = avg_refine
+
+                # Per-attack-type coverage
+                for at, cov in archive_stats['by_attack_type'].items():
+                    wb_data[f'archive/{at}_coverage'] = cov
 
                 import wandb as wandb_lib
                 wandb_lib.log(wb_data, step=gen)
 
-            # Periodic detailed report
+            # Periodic reports
             if gen % (LOG_EVERY_N_GENERATIONS * 2) == 0:
-                logger.log_endpoint_distribution(metrics)
+                logger.log_app_distribution(metrics)
                 print_findings_report(target, reward_system)
-                class _Wrapper:
-                    def best(self_): return gen_best
-                    @property
-                    def organisms(self_): return [gen_best]
-                _w = _Wrapper()
-                _w.fragment_library = gen_best.fragment_library
-                print_gp_analysis(_Wrapper())
+                print_archive_report(archive, target)
+                print_gp_analysis(population, target, phrase_library)
 
-            # Stagnation
+            # Checkpoint
+            if gen % CHECKPOINT_EVERY == 0:
+                save_checkpoint(population, archive, phrase_library,
+                                metrics, gen, logger.log_dir)
+
+            # Stagnation injection
             if metrics.stagnation_detected():
                 print("\n  Stagnation! Injecting diversity...")
                 population.organisms.sort(key=lambda o: o.fitness, reverse=True)
                 n_replace = max(1, len(population.organisms) // 5)
                 for i in range(-n_replace, 0):
-                    population.organisms[i] = Organism(generation=gen)
+                    population.organisms[i] = Organism(
+                        generation=gen, phrase_library=phrase_library,
+                    )
 
     except KeyboardInterrupt:
         print("\n\nInterrupted by user.")
 
+    # ── Final Report ──
     print("\n" + "=" * 60)
     print("  FINAL REPORT")
     print("=" * 60)
@@ -490,26 +716,20 @@ def main():
 
     if best_ever:
         print(f"\n  Best organism:    {best_ever.summary()}")
-    else:
-        print(f"\n  Best organism:    (none ran)")
-
-    if mutator:
-        mstats = mutator.stats()
-        print(f"\n  Mutator stats:    {mstats['total_mutations']} mutations, "
-              f"{mstats['total_fallbacks']} fallbacks "
-              f"({mstats['mutation_rate']:.1%} mutation rate)")
 
     print_findings_report(target, reward_system)
+    print_archive_report(archive, target)
+
     if best_ever:
         class _BestWrapper:
             def best(self): return best_ever
             @property
             def organisms(self): return [best_ever]
-        print_gp_analysis(_BestWrapper())
+        print_gp_analysis(_BestWrapper(), target, phrase_library)
 
-    # Save final report to logs/
-    import json as _json
+    # Save final report
     final_report = {
+        'version': 'v3-compositional',
         'generations': metrics.total_generations,
         'total_requests': metrics.total_requests,
         'total_successes': metrics.total_successes,
@@ -518,18 +738,24 @@ def main():
         'unique_findings': reward_system.total_unique_findings(),
         'best_fitness': best_ever_fitness,
         'best_organism': best_ever.summary() if best_ever else None,
+        'compute_loss': compute_loss,
+        'do_refine': do_refine,
+        'archive': archive.to_dict(),
+        'phrase_library': phrase_library.stats(),
         'findings': [],
         'per_app': {},
     }
+
     for f in target.all_findings():
         final_report['findings'].append({
             'type': f.get('type', 'unknown'),
             'severity': f.get('severity', '?'),
             'detail': f.get('detail', ''),
             'payload': f.get('payload', '')[:200],
+            'payload_tokens': f.get('payload_tokens', [])[:20],
             'app_name': f.get('app_name', 'unknown'),
-            'strategies': f.get('strategies', []),
         })
+
     for app_cfg in TARGET_APPS:
         name = app_cfg['name']
         count = metrics.endpoint_counts.get(name, 0)
@@ -539,22 +765,13 @@ def main():
             'successes': succ,
             'rate': succ / count if count > 0 else 0,
         }
-    if mutator:
-        final_report['mutator'] = mutator.stats()
-    if best_ever:
-        best_prog = best_ever.library.best_program() or best_ever.library.programs[0]
-        final_report['best_program'] = str(best_prog)
-        final_report['sample_payloads'] = [
-            best_prog.execute(clean_input=inp)[:200]
-            for inp in CLEAN_INPUTS[:5]
-        ]
-        final_report['fragments'] = best_ever.fragment_library.stats()
 
-    report_path = os.path.join(logger.log_dir, f'final_report_{int(time.time())}.json')
+    report_path = os.path.join(
+        logger.log_dir, f'final_report_{int(time.time())}.json'
+    )
     with open(report_path, 'w') as f:
-        _json.dump(final_report, f, indent=2, default=str)
+        json.dump(final_report, f, indent=2, default=str)
     print(f"\n  Final report:     {report_path}")
-
     print(f"  Logs saved to:    {logger.log_file}")
     if wb.enabled:
         print(f"  wandb run:        {wb.run.url}")

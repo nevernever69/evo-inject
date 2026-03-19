@@ -1,17 +1,10 @@
 """
-Evolution - GP-based selection, crossover, mutation across generations
+Evolution — Population-level selection, crossover, mutation
 
-Each organism carries a LIBRARY of GP programs (immune system model)
-and a FRAGMENT LIBRARY of discovered text patterns.
-Evolution operates at two levels:
-  - Within lifetime: clonal selection adapts the library (organism.py)
-  - Between lifetimes: population-level selection, crossover, mutation (this file)
-
-Population lifecycle:
-  1. Evaluate fitness of all organisms
-  2. Select parents (tournament selection)
-  3. Create offspring via library crossover + mutation + fragment inheritance
-  4. Replace the population
+Works with the two-level architecture:
+  - GP programs compose structures (phrases + token blocks)
+  - MAP-Elites archive maintains diverse attack portfolio
+  - Population evolves compositional strategy
 """
 
 import random
@@ -19,7 +12,7 @@ import numpy as np
 from organism import Organism
 from gp import (
     crossover as gp_crossover, mutate as gp_mutate,
-    program_complexity, extract_vocabulary, programs_similar,
+    program_complexity, extract_token_ids, programs_similar,
 )
 from config import (
     POPULATION_SIZE, ELITE_RATIO,
@@ -29,27 +22,25 @@ from config import (
 
 
 class Population:
-    """
-    A population of GP-evolved organisms.
-    """
+    """A population of compositional attack organisms."""
 
-    def __init__(self, size=POPULATION_SIZE):
-        self.organisms = [Organism(generation=0) for _ in range(size)]
+    def __init__(self, size=POPULATION_SIZE, phrase_library=None):
+        self.phrase_library = phrase_library
+        self.organisms = [
+            Organism(generation=0, phrase_library=phrase_library)
+            for _ in range(size)
+        ]
         self.generation = 0
         self.history = []
 
     def evaluate_all(self):
-        """Compute fitness for every organism."""
         for org in self.organisms:
             org.compute_fitness()
 
-    def evolve(self):
+    def evolve(self, archive=None):
         """
-        One generation of GP evolution.
-        1. Sort by fitness
-        2. Keep elites (same GP program + brain, fresh memory)
-        3. Tournament select parents
-        4. GP crossover + mutate to fill population
+        One generation of evolution.
+        Optionally seeds from MAP-Elites archive for diversity.
         """
         self.evaluate_all()
         self.generation += 1
@@ -71,36 +62,64 @@ class Population:
 
         new_pop = []
 
-        # Elites carry over (same library + brain, fresh memory/stats)
+        # Carry elites
         for elite in elites:
             child = Organism(
                 library=elite.library.copy(),
                 brain=elite.brain.copy(),
                 generation=self.generation,
+                phrase_library=self.phrase_library,
             )
             new_pop.append(child)
 
-        # Fill rest via reproduction
+        # Inject archive elites for diversity (if available)
+        if archive and archive.occupied_count() > 0:
+            n_archive_inject = min(2, archive.occupied_count())
+            for _ in range(n_archive_inject):
+                cell = archive.random_occupied_cell()
+                if cell and cell.program:
+                    # Create organism from archive program
+                    from organism import ProgramLibrary
+                    from gp import Program
+                    archive_prog = cell.program.copy()
+                    lib = ProgramLibrary(
+                        programs=[archive_prog] + [
+                            Program(max_length=GP_MAX_PROGRAM_LENGTH,
+                                    phrase_library=self.phrase_library)
+                            for _ in range(LIBRARY_SIZE - 1)
+                        ],
+                        size=LIBRARY_SIZE,
+                    )
+                    child = Organism(
+                        library=lib,
+                        generation=self.generation,
+                        phrase_library=self.phrase_library,
+                    )
+                    new_pop.append(child)
+
         target_size = len(self.organisms)
         while len(new_pop) < target_size:
             parent1 = self._tournament_select(ranked)
             parent2 = self._tournament_select(ranked)
 
             if random.random() < GP_CROSSOVER_RATE:
-                # Library crossover: best programs from each parent + GP crossover
-                child = parent1.make_offspring(parent2, self.generation)
+                child = parent1.make_offspring(
+                    parent2, self.generation,
+                    phrase_library=self.phrase_library,
+                )
             else:
-                # Asexual: clone library with per-program mutation
                 better = parent1 if parent1.fitness >= parent2.fitness else parent2
                 child_lib = better.library.copy()
                 for i in range(len(child_lib.programs)):
                     child_lib.programs[i] = gp_mutate(
-                        child_lib.programs[i], GP_MUTATION_RATE
+                        child_lib.programs[i], GP_MUTATION_RATE,
+                        phrase_library=self.phrase_library,
                     )
                 child = Organism(
                     library=child_lib,
                     brain=better.brain.copy(),
                     generation=self.generation,
+                    phrase_library=self.phrase_library,
                 )
 
             new_pop.append(child)
@@ -120,11 +139,6 @@ class Population:
         return np.mean(fits) if fits else 0.0
 
     def diversity(self):
-        """
-        GP diversity: fraction of unique best-program structures.
-        Compares the best program from each organism's library.
-        Two programs are "similar" if >80% of their ops match.
-        """
         if len(self.organisms) < 2:
             return 0.0
 
@@ -132,8 +146,10 @@ class Population:
         sample_size = min(50, len(self.organisms))
         sampled = random.sample(self.organisms, sample_size)
 
-        best_progs = [o.library.best_program() or o.library.programs[0]
-                      for o in sampled]
+        best_progs = [
+            o.library.best_program() or o.library.programs[0]
+            for o in sampled
+        ]
 
         for i in range(len(best_progs)):
             is_unique = True
@@ -148,7 +164,6 @@ class Population:
 
     def genome_stats(self):
         """GP program statistics across all libraries in population."""
-        # Collect ALL programs from ALL libraries
         all_programs = []
         for o in self.organisms:
             all_programs.extend(o.library.programs)
@@ -156,15 +171,10 @@ class Population:
         lengths = [p.length() for p in all_programs]
         complexities = [program_complexity(p) for p in all_programs]
 
-        # Vocabulary analysis across all programs
-        all_chars = set()
-        all_strings = set()
+        all_tokens = set()
         for p in all_programs:
-            chars, strings = extract_vocabulary(p)
-            all_chars.update(chars)
-            all_strings.update(strings)
+            all_tokens.update(extract_token_ids(p))
 
-        # Library-level stats
         total_clonal = sum(o.library.clonal_events for o in self.organisms)
         total_replacements = sum(o.library.replacements for o in self.organisms)
         programs_with_success = sum(
@@ -172,12 +182,9 @@ class Population:
             for o in self.organisms
         )
 
-        # Fragment stats across population
-        total_fragments = sum(
-            len(o.fragment_library.fragments)
-            for o in self.organisms
-            if hasattr(o, 'fragment_library')
-        )
+        # Phrase vs token block balance
+        total_phrases = sum(c['phrases'] for c in complexities)
+        total_blocks = sum(c['token_blocks'] for c in complexities)
 
         stats = {
             'program_length': {
@@ -188,26 +195,19 @@ class Population:
             },
             'unique_ops': {
                 'mean': np.mean([c['unique_ops'] for c in complexities]),
-                'std': np.std([c['unique_ops'] for c in complexities]),
-                'min': min(c['unique_ops'] for c in complexities),
-                'max': max(c['unique_ops'] for c in complexities),
             },
-            'transform_ratio': {
-                'mean': np.mean([c['ratio'] for c in complexities]),
-                'std': np.std([c['ratio'] for c in complexities]),
-                'min': min(c['ratio'] for c in complexities),
-                'max': max(c['ratio'] for c in complexities),
-            },
-            # Library-level aggregate stats
             'total_clonal_events': total_clonal,
             'total_replacements': total_replacements,
             'programs_with_success': programs_with_success,
             'total_programs': len(all_programs),
-            'total_fragments': total_fragments,
+            'total_phrases': total_phrases,
+            'total_token_blocks': total_blocks,
+            'phrase_block_ratio': (
+                total_phrases / max(1, total_blocks) if total_blocks > 0
+                else float('inf')
+            ),
+            '_vocab_tokens': len(all_tokens),
         }
-
-        stats['_vocab_chars'] = len(all_chars)
-        stats['_vocab_strings'] = len(all_strings)
 
         return stats
 

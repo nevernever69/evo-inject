@@ -1,9 +1,8 @@
 """
-Measurement - Metrics, verification, and anti-self-deception
+Measurement - Metrics, verification, and logging
 
-Tracks GP evolution progress: program complexity, vocabulary growth,
-fitness trajectories, and prompt injection discovery rates.
-Optional wandb integration for live dashboards.
+Tracks compositional evolution progress: program complexity,
+phrase library growth, archive coverage, refinement effectiveness.
 """
 
 import time
@@ -23,9 +22,7 @@ except ImportError:
 
 
 class Metrics:
-    """
-    Tracks all measurable quantities across the run.
-    """
+    """Tracks all measurable quantities across the run."""
 
     def __init__(self):
         self.start_time = time.time()
@@ -36,7 +33,6 @@ class Metrics:
         self.gen_diversity = []
         self.gen_success_rate = []
         self.gen_program_lengths = []
-        self.gen_vocab_size = []
 
         # Cumulative
         self.total_requests = 0
@@ -52,7 +48,6 @@ class Metrics:
         self.novel_behaviors = []
 
     def record_generation(self, population):
-        """Record metrics for one generation."""
         self.total_generations += 1
 
         best = population.best()
@@ -60,17 +55,12 @@ class Metrics:
         self.gen_avg_fitness.append(population.avg_fitness())
         self.gen_diversity.append(population.diversity())
 
-        # Aggregate organism stats
         success_rates = []
-        apps_found = set()
         program_lengths = []
 
         for org in population.organisms:
             mem = org.memory
             success_rates.append(mem.success_rate())
-            apps_found.update(mem.apps_with_findings)
-
-            # Use library best program length
             best_prog = org.library.best_program() or org.library.programs[0]
             program_lengths.append(best_prog.length())
 
@@ -82,7 +72,6 @@ class Metrics:
         )
 
     def record_step(self, app_name, success):
-        """Track per-step app usage."""
         self.endpoint_counts[app_name] = self.endpoint_counts.get(app_name, 0) + 1
         self.total_requests += 1
         if success:
@@ -128,19 +117,15 @@ class Logger:
         os.makedirs(log_dir, exist_ok=True)
         self.log_file = os.path.join(log_dir, f'run_{int(time.time())}.jsonl')
 
-    def log_generation(self, gen, metrics, population, gen_best=None, pre_evolve_avg=None):
-        # Always log gen 1 and every N generations
+    def log_generation(self, gen, metrics, population, gen_best=None,
+                       pre_evolve_avg=None, archive=None, phrase_library=None):
         if gen != 1 and gen % LOG_EVERY_N_GENERATIONS != 0:
             return
 
         best = gen_best or population.best()
-
         best_prog = best.library.best_program() or best.library.programs[0]
         lib_stats = best.library.stats()
-        frag_stats = best.fragment_library.stats()
-        sample_payload = best_prog.execute(clean_input='test')
 
-        # Use pre-evolve avg if provided (post-evolve organisms have fresh memory = 0)
         avg_fit = pre_evolve_avg if pre_evolve_avg is not None else population.avg_fitness()
 
         entry = {
@@ -154,12 +139,21 @@ class Logger:
             'total_successes': metrics.total_successes,
             'total_discoveries': metrics.total_discoveries,
             'best_program_length': best_prog.length(),
-            'best_payload_sample': sample_payload[:100],
             'library_size': lib_stats['library_size'],
             'clonal_events': lib_stats['clonal_events'],
             'replacements': lib_stats['replacements'],
-            'fragments_discovered': frag_stats['num_fragments'],
         }
+
+        if archive:
+            arch_stats = archive.stats()
+            entry['archive_coverage'] = arch_stats['coverage']
+            entry['archive_occupied'] = arch_stats['occupied']
+            entry['archive_fills'] = arch_stats['total_fills']
+
+        if phrase_library:
+            p_stats = phrase_library.stats()
+            entry['phrase_total'] = p_stats['total_phrases']
+            entry['phrase_promoted'] = p_stats['promoted_phrases']
 
         print(f"\n{'='*60}")
         print(f"Generation {gen}")
@@ -172,27 +166,26 @@ class Logger:
         print(f"  Discoveries:   {metrics.total_discoveries}")
         print(f"  Best organism: {best.summary()}")
 
-        # GP program info
         print(f"  Best program:  {best_prog}")
-        print(f"  Sample payload: {sample_payload[:80]}")
-
-        # Library stats
         print(f"  Library:       {lib_stats['library_size']} progs, "
               f"clonal={lib_stats['clonal_events']}, "
               f"replaced={lib_stats['replacements']}")
 
-        # Fragment stats
-        print(f"  Fragments:     {frag_stats['num_fragments']} promoted, "
-              f"{frag_stats['num_candidates']} candidates")
+        if archive:
+            print(f"  Archive:       {arch_stats['occupied']}/{arch_stats['total_cells']} "
+                  f"({arch_stats['coverage']:.1%})")
+
+        if phrase_library:
+            p_stats = phrase_library.stats()
+            print(f"  Phrases:       {p_stats['total_phrases']} total, "
+                  f"{p_stats['promoted_phrases']} promoted")
 
         # GP stats
         genome_stats = population.genome_stats()
         print(f"  Avg prog len:  {genome_stats['program_length']['mean']:.1f}")
-        print(f"  Vocab chars:   {genome_stats.get('_vocab_chars', '?')}")
-        print(f"  Vocab strings: {genome_stats.get('_vocab_strings', '?')}")
-        print(f"  Pop clonal:    {genome_stats.get('total_clonal_events', 0)} "
-              f"replacements: {genome_stats.get('total_replacements', 0)} "
-              f"fragments: {genome_stats.get('total_fragments', 0)}")
+        print(f"  Phrases in GP: {genome_stats.get('total_phrases', 0)}")
+        print(f"  Token blocks:  {genome_stats.get('total_token_blocks', 0)}")
+        print(f"  Unique tokens: {genome_stats.get('_vocab_tokens', 0)}")
 
         improving = metrics.is_improving()
         if improving is not None:
@@ -206,27 +199,20 @@ class Logger:
             f.write(json.dumps(entry) + '\n')
 
     def save_best(self, gen, organism, metrics):
-        # Always save gen 1 and every N generations
         if gen != 1 and gen % SAVE_BEST_EVERY != 0:
             return
 
         save_path = os.path.join(self.log_dir, f'best_gen_{gen}.json')
         best_prog = organism.library.best_program() or organism.library.programs[0]
         lib_stats = organism.library.stats()
-        frag_stats = organism.fragment_library.stats()
 
         state = {
             'generation': gen,
             'fitness': organism.fitness,
             'program_length': best_prog.length(),
             'program_repr': str(best_prog),
-            'sample_payloads': [
-                best_prog.execute(clean_input=inp)[:200]
-                for inp in ['test', '1', 'admin', 'hello']
-            ],
             'brain_params': int(organism.brain.network.num_params()),
             'library_stats': lib_stats,
-            'fragment_stats': frag_stats,
             'memory_summary': {
                 'total_reward': organism.memory.total_reward,
                 'success_rate': organism.memory.success_rate(),
@@ -240,11 +226,18 @@ class Logger:
             },
         }
 
+        avg_loss = organism.memory.avg_loss()
+        if avg_loss != float('inf'):
+            state['avg_loss'] = avg_loss
+
+        avg_refine = organism.memory.avg_refinement_improvement()
+        if avg_refine > 0:
+            state['avg_refinement_improvement'] = avg_refine
+
         with open(save_path, 'w') as f:
             json.dump(state, f, indent=2)
 
     def log_app_distribution(self, metrics):
-        """Show per-app request distribution and success rates."""
         print(f"\n  App Distribution:")
         for app_cfg in TARGET_APPS:
             name = app_cfg['name']
@@ -255,17 +248,15 @@ class Logger:
             bar = '#' * int(count / max(1, max_count) * 20)
             print(f"    {name:20s} {count:5d} ({rate:.0%}) {bar}")
 
-    # Keep old name as alias for backward compat with main.py
+    # Keep old name as alias
     log_endpoint_distribution = log_app_distribution
 
 
 class WandbLogger:
-    """
-    Weights & Biases integration.
-    Logs GP evolution metrics for live dashboards.
-    """
+    """Weights & Biases integration."""
 
-    def __init__(self, config_dict=None, project='parasite-llm', enabled=True):
+    def __init__(self, config_dict=None, project='evo-inject-compositional',
+                 enabled=True):
         self.enabled = enabled and HAS_WANDB
         self.run = None
 

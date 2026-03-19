@@ -48,6 +48,10 @@ INTERESTING_TOKENS = []   # Tokens for common English words
 SEPARATOR_TOKENS = []     # Tokens for structural elements
 SPECIAL_TOKENS = []       # BOS/EOS/instruction tokens
 
+# Module-level flag: when True, ALL token generation uses constrained pool only.
+# Set by main_constrained.py at startup so GP mutation/init also respect it.
+CONSTRAINED_MODE = False
+
 
 def init_token_pools(tokenizer):
     """
@@ -115,8 +119,15 @@ def init_token_pools(tokenizer):
     }
 
 
-def _random_token_id():
+def _random_token_id(constrained=False):
     """Pick a random token ID, biased toward interesting tokens."""
+    if constrained or CONSTRAINED_MODE:
+        # Constrained mode: only interesting + separator + special tokens
+        pool = INTERESTING_TOKENS + SEPARATOR_TOKENS + SPECIAL_TOKENS
+        if pool:
+            return random.choice(pool)
+        return random.randint(0, 128255)
+
     if random.random() < 0.4 and INTERESTING_TOKENS:
         return random.choice(INTERESTING_TOKENS)
     elif random.random() < 0.15 and SEPARATOR_TOKENS:
@@ -127,11 +138,12 @@ def _random_token_id():
         return random.randint(0, 128255)
 
 
-def random_token_block(size=None):
+def random_token_block(size=None, constrained=False):
     """Generate a random token block for the sub-semantic search region."""
+    use_constrained = constrained or CONSTRAINED_MODE
     if size is None:
         size = random.randint(TOKEN_BLOCK_MIN, TOKEN_BLOCK_MAX)
-    return [_random_token_id() for _ in range(size)]
+    return [_random_token_id(constrained=use_constrained) for _ in range(size)]
 
 
 # ── Instruction ─────────────────────────────────────

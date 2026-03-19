@@ -39,10 +39,10 @@ from config import (
     REFINE_STEPS, REFINE_CANDIDATES,
     REFINE_ACCEPT_PROB, REFINE_TEMPERATURE, REFINE_TEMP_DECAY,
 )
-from gp import _random_token_id, INTERESTING_TOKENS, TOKEN_POOL
+from gp import _random_token_id, INTERESTING_TOKENS, TOKEN_POOL, SEPARATOR_TOKENS, SPECIAL_TOKENS
 
 
-def refine_token_blocks(components, target, app, target_text):
+def refine_token_blocks(components, target, app, target_text, constrained=False):
     """
     Refine all token blocks in a component list using loss-guided hill climbing.
 
@@ -51,6 +51,7 @@ def refine_token_blocks(components, target, app, target_text):
         target: LLMTarget instance (for compute_loss)
         app: LLMApp instance
         target_text: str — what we want the model to produce
+        constrained: if True, only sample from interesting/separator/special tokens
 
     Returns:
         refined_components: same structure with improved token blocks
@@ -98,7 +99,8 @@ def refine_token_blocks(components, target, app, target_text):
             original_token = block_tokens[pos]
 
             # Generate candidate replacements
-            candidates = _generate_candidates(original_token, REFINE_CANDIDATES)
+            candidates = _generate_candidates(original_token, REFINE_CANDIDATES,
+                                              constrained=constrained)
 
             best_candidate = None
             best_loss = current_loss
@@ -164,16 +166,30 @@ def refine_token_blocks(components, target, app, target_text):
     return components, stats
 
 
-def _generate_candidates(current_token, n_candidates):
+def _generate_candidates(current_token, n_candidates, constrained=False):
     """
     Generate candidate replacement tokens.
 
-    Strategy:
+    If constrained=True: ALL candidates come from INTERESTING_TOKENS + SEPARATOR_TOKENS
+    only (~5000 tokens). No random vocab sampling. This dramatically reduces the
+    search space while keeping tokens that are likely to matter for injection.
+
+    If constrained=False (default):
       - 50% nearby tokens in vocab (local search)
       - 30% interesting tokens (injection-relevant words)
       - 20% random tokens (exploration)
     """
     candidates = []
+
+    if constrained:
+        # Constrained mode: only interesting + separator tokens
+        pool = INTERESTING_TOKENS + SEPARATOR_TOKENS + SPECIAL_TOKENS
+        if not pool:
+            pool = list(range(1000))  # fallback
+        for _ in range(n_candidates):
+            candidates.append(random.choice(pool))
+        return candidates
+
     for _ in range(n_candidates):
         roll = random.random()
         if roll < 0.5:

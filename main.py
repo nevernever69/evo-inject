@@ -60,7 +60,7 @@ def flatten_components(components):
 
 def run_lifetime(organism, target, reward_system, metrics, phrase_library,
                  archive, compute_loss=True, do_refine=True,
-                 detailed=None, current_gen=0):
+                 detailed=None, current_gen=0, constrained=False):
     """
     One organism's lifetime.
 
@@ -118,6 +118,7 @@ def run_lifetime(organism, target, reward_system, metrics, phrase_library,
         if do_refine and has_token_blocks and compute_loss:
             components, refine_stats = refine_token_blocks(
                 components, target, app, app.test_instruction,
+                constrained=constrained,
             )
             if refine_stats:
                 organism.memory.record_refinement(refine_stats)
@@ -315,7 +316,8 @@ def _try_promote_phrases(components, flat_tokens, target, phrase_library,
 
 def run_generation(population, target, reward_system, metrics, gen,
                    phrase_library, archive,
-                   compute_loss=True, do_refine=True, detailed=None):
+                   compute_loss=True, do_refine=True, detailed=None,
+                   constrained=False):
     """Run one full generation."""
     n_organisms = len(population.organisms)
 
@@ -325,7 +327,7 @@ def run_generation(population, target, reward_system, metrics, gen,
         run_lifetime(
             organism, target, reward_system, metrics, phrase_library,
             archive, compute_loss=compute_loss, do_refine=do_refine,
-            detailed=detailed, current_gen=gen,
+            detailed=detailed, current_gen=gen, constrained=constrained,
         )
 
         if (i + 1) % 5 == 0 or (i + 1) == n_organisms:

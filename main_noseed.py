@@ -50,6 +50,7 @@ from main import (
     print_findings_report, print_archive_report, print_gp_analysis,
     save_checkpoint, _try_promote_phrases,
 )
+from detailed_log import DetailedLogger
 
 
 # ── Minimal filler phrases (NO attack knowledge) ──────────
@@ -167,6 +168,7 @@ def main():
     # Initialize population
     metrics = Metrics()
     logger = Logger()
+    detailed = DetailedLogger(log_dir=logger.log_dir, prefix='detailed_noseed')
     population = Population(size=args.pop, phrase_library=phrase_library)
 
     # wandb config
@@ -230,6 +232,7 @@ def main():
                 population, target, reward_system, metrics, gen,
                 phrase_library, archive,
                 compute_loss=compute_loss, do_refine=do_refine,
+                detailed=detailed,
             )
 
             gen_time = time.time() - gen_start
@@ -237,6 +240,12 @@ def main():
             if gen_best.fitness > best_ever_fitness:
                 best_ever = gen_best
                 best_ever_fitness = gen_best.fitness
+
+            # Detailed local logging
+            detailed.log_generation(
+                gen, metrics, population, archive, phrase_library,
+                gen_time, compute_loss, do_refine,
+            )
 
             # Console logging
             logger.log_generation(
@@ -406,6 +415,7 @@ def main():
         json.dump(final_report, f, indent=2, default=str)
     print(f"\n  Final report:     {report_path}")
     print(f"  Logs saved to:    {logger.log_file}")
+    detailed.final_save()
     if wb.enabled:
         print(f"  wandb run:        {wb.run.url}")
     print("=" * 60)

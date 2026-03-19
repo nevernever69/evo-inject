@@ -47,6 +47,7 @@ from gp import program_complexity, extract_token_ids
 from phrases import PhraseLibrary
 from archive import MAPElitesArchive
 from refinement import refine_token_blocks
+from detailed_log import DetailedLogger
 
 
 def flatten_components(components):
@@ -58,7 +59,8 @@ def flatten_components(components):
 
 
 def run_lifetime(organism, target, reward_system, metrics, phrase_library,
-                 archive, compute_loss=True, do_refine=True):
+                 archive, compute_loss=True, do_refine=True,
+                 detailed=None, current_gen=0):
     """
     One organism's lifetime.
 
@@ -119,6 +121,19 @@ def run_lifetime(organism, target, reward_system, metrics, phrase_library,
             )
             if refine_stats:
                 organism.memory.record_refinement(refine_stats)
+                if detailed and refine_stats.get('improvements', 0) > 0:
+                    detailed.log_refinement(
+                        gen=current_gen,
+                        organism_id=organism.id,
+                        app_name=app.name,
+                        block_idx=refine_stats.get('block_idx', 0),
+                        loss_before=refine_stats.get('loss_before'),
+                        loss_after=refine_stats.get('loss_after'),
+                        tokens_before=refine_stats.get('tokens_before', []),
+                        tokens_after=refine_stats.get('tokens_after', []),
+                        improvements=refine_stats.get('improvements', 0),
+                        steps=refine_stats.get('steps', 0),
+                    )
 
         # Flatten to token list
         flat_tokens = flatten_components(components)
@@ -217,10 +232,52 @@ def run_lifetime(organism, target, reward_system, metrics, phrase_library,
                 reward += archive_bonus
                 organism.memory.total_reward += archive_bonus
 
+            # Detailed logging: every successful attack
+            if detailed:
+                components_summary = [
+                    {'type': ct, 'meta': str(meta), 'n_tokens': len(toks)}
+                    for ct, meta, toks in components
+                ]
+                detailed.log_attack(
+                    gen=current_gen,
+                    organism_id=organism.id,
+                    app_name=app.name,
+                    payload_text=payload_text,
+                    payload_tokens=flat_tokens,
+                    response_text=response.get('text', ''),
+                    findings=findings,
+                    reward=reward,
+                    loss=loss_info.get('loss') if loss_info else None,
+                    baseline_loss=loss_info.get('baseline_loss') if loss_info else None,
+                    coherence_info=coherence_info,
+                    program_str=str(active_program),
+                    components_summary=components_summary,
+                    refinement_stats=refine_stats,
+                    phrase_indices=list(used_phrase_indices),
+                    attack_type=attack_type,
+                    structure_class=structure_class,
+                )
+
+                if inserted:
+                    detailed.log_archive_fill(
+                        gen=current_gen,
+                        attack_type=attack_type,
+                        app_name=app.name,
+                        structure_class=structure_class,
+                        fitness=reward,
+                        payload_text=payload_text,
+                        payload_tokens=flat_tokens,
+                        response_text=response.get('text', ''),
+                        program_str=str(active_program),
+                        is_new=is_new,
+                        findings=findings,
+                    )
+
             # Try to promote new phrases from successful payloads
             if reward > 50:
                 _try_promote_phrases(
                     components, flat_tokens, target, phrase_library, attack_type,
+                    detailed=detailed, current_gen=current_gen,
                 )
 
         # Brain learns
@@ -232,7 +289,7 @@ def run_lifetime(organism, target, reward_system, metrics, phrase_library,
 
 
 def _try_promote_phrases(components, flat_tokens, target, phrase_library,
-                         attack_type):
+                         attack_type, detailed=None, current_gen=0):
     """Try to promote successful component sequences as new phrases."""
     for ctype, metadata, tokens in components:
         if ctype == 'token_block' and len(tokens) >= 3:
@@ -242,14 +299,23 @@ def _try_promote_phrases(components, flat_tokens, target, phrase_library,
                 # Only promote if it has recognizable words
                 words = text.strip().split()
                 if len(words) >= 2:
+                    old_size = phrase_library.size()
                     phrase_library.try_promote(
                         text.strip(), tokens, category=attack_type,
                     )
+                    if detailed and phrase_library.size() > old_size:
+                        detailed.log_promoted_phrase(
+                            gen=current_gen,
+                            text=text.strip(),
+                            tokens=tokens,
+                            category=attack_type,
+                            source='token_block',
+                        )
 
 
 def run_generation(population, target, reward_system, metrics, gen,
                    phrase_library, archive,
-                   compute_loss=True, do_refine=True):
+                   compute_loss=True, do_refine=True, detailed=None):
     """Run one full generation."""
     n_organisms = len(population.organisms)
 
@@ -259,6 +325,7 @@ def run_generation(population, target, reward_system, metrics, gen,
         run_lifetime(
             organism, target, reward_system, metrics, phrase_library,
             archive, compute_loss=compute_loss, do_refine=do_refine,
+            detailed=detailed, current_gen=gen,
         )
 
         if (i + 1) % 5 == 0 or (i + 1) == n_organisms:
@@ -538,6 +605,7 @@ def main():
     # Initialize population with phrase library
     metrics = Metrics()
     logger = Logger()
+    detailed = DetailedLogger(log_dir=logger.log_dir, prefix='detailed')
     population = Population(size=args.pop, phrase_library=phrase_library)
 
     # wandb config
@@ -599,6 +667,7 @@ def main():
                 population, target, reward_system, metrics, gen,
                 phrase_library, archive,
                 compute_loss=compute_loss, do_refine=do_refine,
+                detailed=detailed,
             )
 
             gen_time = time.time() - gen_start
@@ -606,6 +675,12 @@ def main():
             if gen_best.fitness > best_ever_fitness:
                 best_ever = gen_best
                 best_ever_fitness = gen_best.fitness
+
+            # Detailed local logging (every generation)
+            detailed.log_generation(
+                gen, metrics, population, archive, phrase_library,
+                gen_time, compute_loss, do_refine,
+            )
 
             # Console logging
             logger.log_generation(
@@ -773,6 +848,7 @@ def main():
         json.dump(final_report, f, indent=2, default=str)
     print(f"\n  Final report:     {report_path}")
     print(f"  Logs saved to:    {logger.log_file}")
+    detailed.final_save()
     if wb.enabled:
         print(f"  wandb run:        {wb.run.url}")
     print("=" * 60)

@@ -52,6 +52,11 @@ SPECIAL_TOKENS = []       # BOS/EOS/instruction tokens
 # Set by main_constrained.py at startup so GP mutation/init also respect it.
 CONSTRAINED_MODE = False
 
+# Optional custom token pool. When set (non-None list), constrained mode uses
+# this pool instead of the default INTERESTING + SEPARATOR + SPECIAL.
+# Set by main_vocab_ablation.py for vocab size / composition experiments.
+CUSTOM_POOL = None
+
 
 def init_token_pools(tokenizer):
     """
@@ -122,8 +127,11 @@ def init_token_pools(tokenizer):
 def _random_token_id(constrained=False):
     """Pick a random token ID, biased toward interesting tokens."""
     if constrained or CONSTRAINED_MODE:
-        # Constrained mode: only interesting + separator + special tokens
-        pool = INTERESTING_TOKENS + SEPARATOR_TOKENS + SPECIAL_TOKENS
+        # Use custom pool if set, otherwise default constrained pool
+        if CUSTOM_POOL is not None:
+            pool = CUSTOM_POOL
+        else:
+            pool = INTERESTING_TOKENS + SEPARATOR_TOKENS + SPECIAL_TOKENS
         if pool:
             return random.choice(pool)
         return random.randint(0, 128255)

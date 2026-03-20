@@ -39,6 +39,7 @@ from config import (
     REFINE_STEPS, REFINE_CANDIDATES,
     REFINE_ACCEPT_PROB, REFINE_TEMPERATURE, REFINE_TEMP_DECAY,
 )
+import gp as _gp
 from gp import _random_token_id, INTERESTING_TOKENS, TOKEN_POOL, SEPARATOR_TOKENS, SPECIAL_TOKENS
 
 
@@ -182,8 +183,11 @@ def _generate_candidates(current_token, n_candidates, constrained=False):
     candidates = []
 
     if constrained:
-        # Constrained mode: only interesting + separator tokens
-        pool = INTERESTING_TOKENS + SEPARATOR_TOKENS + SPECIAL_TOKENS
+        # Use custom pool if set, otherwise default constrained pool
+        if _gp.CUSTOM_POOL is not None:
+            pool = _gp.CUSTOM_POOL
+        else:
+            pool = INTERESTING_TOKENS + SEPARATOR_TOKENS + SPECIAL_TOKENS
         if not pool:
             pool = list(range(1000))  # fallback
         for _ in range(n_candidates):
